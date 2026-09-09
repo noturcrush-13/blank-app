@@ -1,5 +1,10 @@
 .streamlit/secrets.toml
 
+# Kunci service account Google Cloud yang didownload sebagai .json mentah
+# (isinya sudah dipindah ke .streamlit/secrets.toml) — jangan pernah ke-commit.
+/*.json
+!.devcontainer/devcontainer.json
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
