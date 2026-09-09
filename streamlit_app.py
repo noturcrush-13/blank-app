@@ -77,6 +77,30 @@ DEFAULT_STATUS_WEIGHT = {
 st.markdown(
     """
     <style>
+    /* Pastikan latar selalu cerah walau browser/OS pakai dark mode */
+    .stApp, section[data-testid="stSidebar"] > div { background-color: #ffffff; }
+    section[data-testid="stSidebar"] { background-color: #f5faf5; }
+
+    /* Banner header ala BeCare */
+    .becare-hero{
+        background: linear-gradient(135deg, #e8f7e8 0%, #ffffff 75%);
+        border: 1px solid #0ca30c2e; border-radius: 16px;
+        padding: 1.3rem 1.7rem; margin-bottom: 1.1rem;
+        box-shadow: 0 2px 12px rgba(12,163,12,0.09);
+    }
+    .becare-hero h1{ margin:0; font-size:1.65rem; color:#0a5c0a; line-height:1.3; }
+    .becare-hero p{ margin:.35rem 0 0; color:#555; font-size:.92rem; }
+
+    /* Kartu metric (Low/Medium/High/Total dst) */
+    div[data-testid="stMetric"]{
+        background:#ffffff; border:1px solid #e6e6df; border-radius:12px;
+        padding:.85rem 1rem .55rem; box-shadow:0 1px 5px rgba(0,0,0,.045);
+    }
+
+    /* Aksen hijau di setiap judul section */
+    h2, h3{ border-left:4px solid #0ca30c; padding-left:.65rem; }
+
+    /* Badge severity kecil (dipakai untuk tabel/keterangan) */
     .badge{padding:2px 10px;border-radius:999px;font-weight:600;font-size:0.8rem;
            display:inline-block;white-space:nowrap;}
     .badge-low{background:#0ca30c1a;color:#0ca30c;border:1px solid #0ca30c55;}
@@ -109,6 +133,39 @@ def gsheet_csv_url(sheet_id: str, sheet_name: str) -> str:
 def load_from_gsheet(sheet_id: str, sheet_name: str) -> pd.DataFrame:
     url = gsheet_csv_url(sheet_id, sheet_name)
     return pd.read_csv(url)
+
+
+def has_service_account() -> bool:
+    """True kalau kredensial Google Sheets API (service account) sudah dipasang di Secrets."""
+    try:
+        return "gcp_service_account" in st.secrets
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def get_gspread_client():
+    import gspread
+    from google.oauth2.service_account import Credentials
+
+    creds = Credentials.from_service_account_info(
+        dict(st.secrets["gcp_service_account"]),
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive.readonly",
+        ],
+    )
+    return gspread.authorize(creds)
+
+
+@st.cache_data(ttl=300, show_spinner="Mengambil data terbaru dari Google Sheet (API)...")
+def load_via_api(sheet_id: str, sheet_name: str) -> pd.DataFrame:
+    gc = get_gspread_client()
+    ws = gc.open_by_key(sheet_id).worksheet(sheet_name)
+    values = ws.get_all_values()
+    if not values:
+        return pd.DataFrame()
+    header, rows = values[0], values[1:]
+    return pd.DataFrame(rows, columns=header)
 
 
 @st.cache_data(show_spinner=False)
@@ -201,94 +258,43 @@ def compute_spi(df_period: pd.DataFrame, sev_w: dict, status_w: dict, status_def
 
 
 # =========================================================================
-# SIDEBAR — SUMBER DATA
+# SUMBER DATA — dipakai diam-diam dari config/secrets tersimpan, sidebar
+# cuma nampilin tombol Refresh (menu koneksi disembunyikan, sudah tidak
+# perlu di-setup ulang tiap buka app).
 # =========================================================================
 saved_cfg = load_saved_config()
-
-st.sidebar.header("🔌 Sumber Data")
-source_mode = st.sidebar.radio(
-    "Ambil data dari", ["Google Sheet (Live)", "Upload File"],
-    index=0 if saved_cfg.get("source_mode", "Google Sheet (Live)") == "Google Sheet (Live)" else 1,
-)
+source_mode = saved_cfg.get("source_mode", "Google Sheet (Live)")
+sheet_url = saved_cfg.get("sheet_url", "")
+sheet_tab = saved_cfg.get("sheet_tab", "Form Responses 1")
+use_api = has_service_account()
 
 raw_df = None
 data_error = None
 
-if source_mode == "Google Sheet (Live)":
-    with st.sidebar.expander("Cara menghubungkan", expanded=False):
-        st.markdown(
-            "1. Buka spreadsheet BeCare Anda.\n"
-            "2. Klik **Share** → set ke **Anyone with the link – Viewer**.\n"
-            "3. Salin URL sheet-nya, tempel di bawah.\n"
-            "4. Isi nama tab (default: `Form Responses 1`).\n"
-            "5. Link otomatis tersimpan — buka app lagi kapan pun tanpa paste ulang."
-        )
-    sheet_url = st.sidebar.text_input(
-        "URL / ID Google Sheet",
-        value=saved_cfg.get("sheet_url", ""),
-        placeholder="https://docs.google.com/spreadsheets/d/...",
-    )
-    sheet_tab = st.sidebar.text_input("Nama Tab (sheet)", value=saved_cfg.get("sheet_tab", "Form Responses 1"))
+if st.sidebar.button("🔄 Refresh Data", use_container_width=True):
+    load_from_gsheet.clear()
+    load_via_api.clear()
+    st.rerun()
 
-    # Auto-simpan tiap kali link/tab berubah, supaya kunjungan berikutnya tidak perlu paste ulang.
-    if sheet_url.strip() and (sheet_url != saved_cfg.get("sheet_url") or sheet_tab != saved_cfg.get("sheet_tab")):
-        save_config({"source_mode": source_mode, "sheet_url": sheet_url, "sheet_tab": sheet_tab})
-        saved_cfg = {"source_mode": source_mode, "sheet_url": sheet_url, "sheet_tab": sheet_tab}
-
-    col_a, col_b = st.sidebar.columns([1, 1])
-    do_refresh = col_a.button("🔄 Refresh", use_container_width=True)
-    if do_refresh:
-        load_from_gsheet.clear()
-    if col_b.button("🗑️ Lupakan link", use_container_width=True):
-        save_config({})
-        st.rerun()
-
-    if sheet_url.strip():
-        st.sidebar.caption("💾 Link ini tersimpan lokal — otomatis terpakai lagi tiap buka app.")
-        try:
-            sheet_id = extract_sheet_id(sheet_url)
-            raw_df = load_from_gsheet(sheet_id, sheet_tab)
-        except Exception as e:  # noqa: BLE001
-            data_error = f"Gagal mengambil data dari Google Sheet: {e}"
-    else:
-        st.sidebar.info("Tempel URL Google Sheet untuk data live, atau pindah ke mode Upload File.")
-
+if source_mode == "Google Sheet (Live)" and sheet_url.strip():
+    try:
+        sheet_id = extract_sheet_id(sheet_url)
+        raw_df = load_via_api(sheet_id, sheet_tab) if use_api else load_from_gsheet(sheet_id, sheet_tab)
+    except Exception as e:  # noqa: BLE001
+        data_error = f"Gagal mengambil data dari Google Sheet: {e}"
+elif source_mode != "Google Sheet (Live)":
+    data_error = "Sumber data belum dikonfigurasi (mode Upload File tidak lagi tersedia di sidebar)."
 else:
-    uploaded = st.sidebar.file_uploader("Upload file (.xlsx / .csv)", type=["xlsx", "xls", "csv"])
-    if uploaded is not None:
-        file_bytes = uploaded.getvalue()
-        try:
-            if uploaded.name.lower().endswith(".csv"):
-                raw_df = load_from_upload(file_bytes, uploaded.name, None)
-            else:
-                sheets = list_excel_sheets(file_bytes)
-                default_idx = sheets.index("Form Responses 1") if "Form Responses 1" in sheets else 0
-                chosen_sheet = st.sidebar.selectbox("Pilih sheet", sheets, index=default_idx)
-                raw_df = load_from_upload(file_bytes, uploaded.name, chosen_sheet)
-        except Exception as e:  # noqa: BLE001
-            data_error = f"Gagal membaca file: {e}"
-    else:
-        st.sidebar.info("Upload data untuk mulai (bisa file export Google Form BeCare).")
+    data_error = "Sumber data belum dikonfigurasi. Hubungi admin untuk menghubungkan Google Sheet."
 
 if data_error:
     st.sidebar.error(data_error)
 
-# =========================================================================
-# SIDEBAR — PEMETAAN KOLOM (opsional, auto-detect + override manual)
-# =========================================================================
-col_map = {}
-if raw_df is not None and not raw_df.empty:
-    with st.sidebar.expander("🧭 Pemetaan Kolom (opsional)", expanded=False):
-        st.caption("Otomatis terdeteksi dari nama kolom. Ubah manual bila sheet Anda berbeda struktur.")
-        options = ["(tidak ada)"] + list(raw_df.columns)
-        for key, keywords in COLUMN_CANDIDATES.items():
-            detected = detect_column(raw_df.columns, keywords)
-            idx = options.index(detected) if detected in options else 0
-            picked = st.selectbox(key, options, index=idx, key=f"map_{key}")
-            col_map[key] = None if picked == "(tidak ada)" else picked
-else:
-    for key, keywords in COLUMN_CANDIDATES.items():
-        col_map[key] = None
+# Pemetaan kolom selalu auto-deteksi (menu manual override disembunyikan dari sidebar).
+col_map = {
+    key: (detect_column(raw_df.columns, keywords) if raw_df is not None and not raw_df.empty else None)
+    for key, keywords in COLUMN_CANDIDATES.items()
+}
 
 # =========================================================================
 # OLAH DATA
@@ -364,9 +370,15 @@ if not status_w:
 # =========================================================================
 periode_txt = anchor_label if anchor_label else "belum ada periode dipilih"
 
-st.title("🟢 BeCare — System Performance Index & Highlight Issue")
-st.caption(f"Monitoring sistem untuk operasional yang lebih andal · **{periode_txt}**")
-st.divider()
+st.markdown(
+    f"""
+    <div class="becare-hero">
+        <h1>🟢 BeCare — System Performance Index &amp; Highlight Issue</h1>
+        <p>Monitoring sistem untuk operasional yang lebih andal · <b>{periode_txt}</b></p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 # =========================================================================
 # SECTION 0 — REKAP LAPORAN (volume mentah, TIDAK butuh klasifikasi severity)
@@ -651,21 +663,10 @@ dc1.download_button("⬇️ Download Highlight Issue (CSV)", data=csv_bytes, fil
 
 # --- opsional: simpan balik ke Google Sheet, hanya aktif jika service account tersedia ---
 if source_mode == "Google Sheet (Live)" and sheet_url.strip():
-    try:
-        import gspread
-        from google.oauth2.service_account import Credentials
-        has_gspread = "gcp_service_account" in st.secrets
-    except Exception:  # noqa: BLE001
-        has_gspread = False
-
-    if has_gspread:
+    if has_service_account():
         if dc2.button("💾 Simpan Highlight Issue ke tab 'Highlight Issue' di Google Sheet"):
             try:
-                creds = Credentials.from_service_account_info(
-                    st.secrets["gcp_service_account"],
-                    scopes=["https://www.googleapis.com/auth/spreadsheets"],
-                )
-                gc = gspread.authorize(creds)
+                gc = get_gspread_client()
                 sh = gc.open_by_key(extract_sheet_id(sheet_url))
                 try:
                     ws = sh.worksheet("Highlight Issue")
