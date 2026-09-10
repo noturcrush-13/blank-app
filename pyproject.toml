@@ -11,6 +11,7 @@ dependencies = [
     "plotly>=5.24",
     "gspread>=6.1",
     "google-auth>=2.34",
+    "requests>=2.32",
 ]
 
 [tool.uv]

@@ -46,8 +46,11 @@ CATEGORICAL = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#4a3aa7",
 
 HIGHLIGHT_COLUMNS = [
     "No", "Modul", "Tanggal Pelaporan", "Deskripsi",
-    "Solusi / Update", "Risiko Isu", "Due Date", "Status",
+    "Solusi / Update", "Risiko Isu", "Due Date", "Status", "Link",
 ]
+
+# List ClickUp default: space "Monitoring All System" -> "Monitoring Issue Operational".
+CLICKUP_DEFAULT_LIST_ID = "901820651612"
 
 # Kandidat nama kolom dari sheet "Form Responses 1" milik BeCare — dipakai
 # untuk auto-deteksi kolom supaya tetap jalan walau header sheet live sedikit berubah.
@@ -68,10 +71,13 @@ SOLUSI_CANDIDATES = ["cara penyelesaian", "solusi"]
 
 DEFAULT_SEVERITY_WEIGHT = {"Low": 1, "Medium": 2, "High": 3}
 DEFAULT_STATUS_WEIGHT = {
-    "Closed Permanent": 0,
-    "Closed Temporary (workaround)": 1,
-    "Workaround": 1,
     "Open": 2,
+    "On Progress": 1,
+    "Close": 0,
+    "Closed": 0,
+    "Closed Permanent": 0,
+    "Workaround": 1,
+    "Closed Temporary (workaround)": 1,
 }
 
 st.markdown(
@@ -124,7 +130,7 @@ st.markdown(
 
 
 # =========================================================================
-# HELPER — AMBIL DATA (GOOGLE SHEET LIVE / UPLOAD FILE)
+# HELPER — AMBIL DATA GOOGLE SHEET (dipakai tab Rekap Laporan)
 # =========================================================================
 def extract_sheet_id(url_or_id: str) -> str:
     """Terima URL lengkap Google Sheet ATAU langsung ID-nya."""
@@ -179,22 +185,8 @@ def load_via_api(sheet_id: str, sheet_name: str) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=header)
 
 
-@st.cache_data(show_spinner=False)
-def load_from_upload(file_bytes: bytes, file_name: str, sheet_name: str) -> pd.DataFrame:
-    import io
-    buf = io.BytesIO(file_bytes)
-    if file_name.lower().endswith(".csv"):
-        return pd.read_csv(buf)
-    return pd.read_excel(buf, sheet_name=sheet_name)
-
-
-def list_excel_sheets(file_bytes: bytes) -> list[str]:
-    import io
-    return pd.ExcelFile(io.BytesIO(file_bytes)).sheet_names
-
-
 # =========================================================================
-# HELPER — NORMALISASI DATA
+# HELPER — NORMALISASI DATA (Google Sheet / rekap laporan)
 # =========================================================================
 def detect_column(columns, keywords) -> str | None:
     low_map = {c: str(c).strip().lower() for c in columns}
@@ -216,7 +208,7 @@ def coalesce(df: pd.DataFrame, candidates) -> pd.Series:
 
 
 def normalize_severity(val):
-    if pd.isna(val):
+    if val is None or (not isinstance(val, str) and pd.isna(val)):
         return None
     v = str(val).strip().title()
     return v if v in ("Low", "Medium", "High") else None
@@ -269,13 +261,221 @@ def compute_spi(df_period: pd.DataFrame, sev_w: dict, status_w: dict, status_def
 
 
 # =========================================================================
-# SUMBER DATA — dipakai diam-diam dari Secrets/config tersimpan, sidebar
-# cuma nampilin tombol Refresh (menu koneksi disembunyikan, sudah tidak
-# perlu di-setup ulang tiap buka app).
-#
-# Prioritas sumber sheet_url/sheet_tab: Secrets (jalan di Streamlit Cloud
-# maupun lokal lewat .streamlit/secrets.toml) -> file config lokal
-# (.becare_dashboard_config.json, cuma ada di komputer ini).
+# HELPER — INTEGRASI CLICKUP (dipakai tab Highlight Issue & SPI)
+# =========================================================================
+CLICKUP_STATUS_NORMALIZE = {
+    "OPEN": "Open",
+    "CLOSE": "Close",
+    "CLOSED": "Close",
+    "DONE": "Close",
+    "COMPLETE": "Close",
+    "ON PROGRESS": "On Progress",
+    "IN PROGRESS": "On Progress",
+    "ONGOING": "On Progress",
+}
+
+
+def has_clickup() -> bool:
+    try:
+        return bool(st.secrets["clickup"].get("api_token"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def clickup_list_id() -> str:
+    try:
+        lid = str(st.secrets["clickup"].get("list_id", "")).strip()
+    except Exception:  # noqa: BLE001
+        lid = ""
+    return lid or CLICKUP_DEFAULT_LIST_ID
+
+
+def normalize_clickup_status(s) -> str:
+    if not s:
+        return "Open"
+    return CLICKUP_STATUS_NORMALIZE.get(str(s).strip().upper(), str(s).strip().title())
+
+
+def _cf_by_name(task: dict) -> dict:
+    return {cf.get("name"): cf for cf in task.get("custom_fields", []) if cf.get("name")}
+
+
+def _cf_dropdown(cf: dict | None):
+    """ClickUp dropdown value bisa berupa UUID option ATAU orderindex integer."""
+    if not cf or cf.get("value") in (None, ""):
+        return None
+    val = cf["value"]
+    opts = (cf.get("type_config") or {}).get("options", [])
+    for o in opts:
+        if str(o.get("id")) == str(val):
+            return o.get("name") or o.get("label")
+    try:
+        vi = int(val)
+        for o in opts:
+            if o.get("orderindex") == vi:
+                return o.get("name") or o.get("label")
+    except (ValueError, TypeError):
+        pass
+    return str(val)
+
+
+def _cf_date(cf: dict | None):
+    if not cf or not cf.get("value"):
+        return pd.NaT
+    try:
+        return pd.to_datetime(int(cf["value"]), unit="ms")
+    except (ValueError, TypeError):
+        return pd.to_datetime(cf["value"], errors="coerce")
+
+
+def _cf_text(cf: dict | None):
+    if not cf:
+        return None
+    v = cf.get("value")
+    return str(v).strip() if v not in (None, "") else None
+
+
+def _epoch_ms(v):
+    if not v:
+        return pd.NaT
+    try:
+        return pd.to_datetime(int(v), unit="ms")
+    except (ValueError, TypeError):
+        return pd.to_datetime(v, errors="coerce")
+
+
+def _local_date_str(ts) -> str:
+    """Tanggal kalender dari timestamp ClickUp.
+
+    ClickUp menyimpan field 'date' sebagai midnight di zona waktu workspace
+    (WIB/WITA), jadi nilainya bisa jatuh di sore hari UTC. Geser +12 jam
+    sebelum ambil tanggalnya supaya kalendernya sesuai tampilan ClickUp.
+    """
+    if ts is None or pd.isna(ts):
+        return "-"
+    return (ts + pd.Timedelta(hours=12)).date().isoformat()
+
+
+def _extract_labeled(text: str | None, label: str):
+    """Ambil isi 'Label: ....' dari markdown/plain description (tahan format **Label:**)."""
+    if not text:
+        return None
+    m = re.search(rf"{re.escape(label)}\s*:?\s*\**\s*(.+?)(?:\n|$)", text, re.IGNORECASE)
+    if not m:
+        return None
+    out = m.group(1).strip().strip("*").strip()
+    return out or None
+
+
+def _is_placeholder(v: str | None) -> bool:
+    if not v:
+        return True
+    s = v.strip().lower().rstrip(".")
+    return s in ("", "-", "n/a", "na", "belum ditentukan") or s.startswith("tbd")
+
+
+def _clean_solusi(text: str | None, root_cause: str | None) -> str:
+    parts = []
+    wa = _extract_labeled(text, "Solusi Sementara (Workaround)")
+    lp = _extract_labeled(text, "Solusi Jangka Panjang")
+    if not _is_placeholder(wa):
+        parts.append(f"Workaround: {wa}")
+    if not _is_placeholder(lp):
+        parts.append(f"Jangka panjang: {lp}")
+    if not _is_placeholder(root_cause):
+        parts.append(f"Root cause: {root_cause}")
+    return " | ".join(parts) if parts else "-"
+
+
+def _clickup_tasks_to_df(tasks: list[dict]) -> pd.DataFrame:
+    rows = []
+    for t in tasks:
+        cf = _cf_by_name(t)
+        desc = t.get("markdown_description") or t.get("description") or t.get("text_content") or ""
+
+        modul = _cf_dropdown(cf.get("Jenis Kendala")) or _extract_labeled(desc, "Modul") or "Lainnya"
+
+        tgl = _cf_date(cf.get("Timestamp"))
+        if pd.isna(tgl):
+            tgl = _epoch_ms(t.get("date_created"))
+
+        deskripsi = _cf_text(cf.get("Kronologi Issue")) or (t.get("name") or "").strip() or "-"
+
+        solusi = _clean_solusi(desc, _cf_text(cf.get("Root Cause")))
+
+        sev = normalize_severity(_cf_dropdown(cf.get("Risiko Issue"))) or "Belum Dinilai"
+
+        due = _epoch_ms(t.get("due_date"))
+        if pd.isna(due):
+            due = _cf_date(cf.get("Timestamps Closed"))
+        due_txt = _local_date_str(due) if not pd.isna(due) else "TBD"
+
+        status_raw = _cf_dropdown(cf.get("Status")) or (t.get("status") or {}).get("status")
+        status = normalize_clickup_status(status_raw)
+
+        rows.append({
+            "No": 0,
+            "Modul": modul,
+            "Tanggal Pelaporan": _local_date_str(tgl),
+            "Deskripsi": deskripsi,
+            "Solusi / Update": solusi,
+            "Risiko Isu": sev,
+            "Due Date": due_txt,
+            "Status": status,
+            "Link": t.get("url") or "",
+        })
+
+    df = pd.DataFrame(rows, columns=HIGHLIGHT_COLUMNS)
+    if not df.empty:
+        # urutkan: High dulu, lalu terbaru
+        rank = {"High": 3, "Medium": 2, "Low": 1, "Belum Dinilai": 0}
+        df["_r"] = df["Risiko Isu"].map(rank).fillna(0)
+        df["_d"] = pd.to_datetime(df["Tanggal Pelaporan"], errors="coerce")
+        df = df.sort_values(["_r", "_d"], ascending=[False, False]).drop(columns=["_r", "_d"])
+        df["No"] = range(1, len(df) + 1)
+    return df.reset_index(drop=True)
+
+
+@st.cache_data(ttl=300, show_spinner="Menarik issue dari ClickUp...")
+def fetch_clickup_issues(list_id: str) -> pd.DataFrame:
+    import requests
+
+    token = st.secrets["clickup"]["api_token"]
+    headers = {"Authorization": token}
+    params = {
+        "include_closed": "true",
+        "subtasks": "false",
+        "include_markdown_description": "true",
+    }
+    all_tasks: list[dict] = []
+    for page in range(0, 50):
+        resp = requests.get(
+            f"https://api.clickup.com/api/v2/list/{list_id}/task",
+            headers=headers, params={**params, "page": page}, timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        batch = data.get("tasks", [])
+        all_tasks.extend(batch)
+        if data.get("last_page") or not batch:
+            break
+    return _clickup_tasks_to_df(all_tasks)
+
+
+def highlight_to_spi_source(hdf: pd.DataFrame) -> pd.DataFrame:
+    """Ubah tabel Highlight Issue jadi input compute_spi (kolom severity + status)."""
+    if hdf is None or hdf.empty:
+        return pd.DataFrame(columns=["modul", "severity", "status"])
+    return pd.DataFrame({
+        "modul": hdf.get("Modul", pd.Series(dtype=object)),
+        "severity": hdf.get("Risiko Isu", pd.Series(dtype=object)).map(normalize_severity),
+        "status": hdf.get("Status", pd.Series(dtype=object)),
+    })
+
+
+# =========================================================================
+# SUMBER DATA GOOGLE SHEET — dipakai diam-diam dari Secrets/config tersimpan.
+# Prioritas sheet_url/sheet_tab: Secrets -> file config lokal.
 # =========================================================================
 saved_cfg = load_saved_config()
 try:
@@ -295,6 +495,7 @@ data_error = None
 if st.sidebar.button("🔄 Refresh Data", use_container_width=True):
     load_from_gsheet.clear()
     load_via_api.clear()
+    fetch_clickup_issues.clear()
     st.rerun()
 
 if source_mode == "Google Sheet (Live)" and sheet_url.strip():
@@ -302,36 +503,48 @@ if source_mode == "Google Sheet (Live)" and sheet_url.strip():
         sheet_id = extract_sheet_id(sheet_url)
         raw_df = load_via_api(sheet_id, sheet_tab) if use_api else load_from_gsheet(sheet_id, sheet_tab)
     except Exception as e:  # noqa: BLE001
-        data_error = f"Gagal mengambil data dari Google Sheet: {e}"
-elif source_mode != "Google Sheet (Live)":
-    data_error = "Sumber data belum dikonfigurasi (mode Upload File tidak lagi tersedia di sidebar)."
+        data_error = f"Gagal mengambil data Rekap dari Google Sheet: {e}"
 else:
-    data_error = "Sumber data belum dikonfigurasi. Hubungi admin untuk menghubungkan Google Sheet."
+    data_error = "Sumber data Rekap belum dikonfigurasi (Google Sheet)."
 
 if data_error:
     st.sidebar.error(data_error)
 
-# Pemetaan kolom selalu auto-deteksi (menu manual override disembunyikan dari sidebar).
+# Pemetaan kolom selalu auto-deteksi.
 col_map = {
     key: (detect_column(raw_df.columns, keywords) if raw_df is not None and not raw_df.empty else None)
     for key, keywords in COLUMN_CANDIDATES.items()
 }
 
 # =========================================================================
-# OLAH DATA
+# OLAH DATA REKAP (Google Sheet)
 # =========================================================================
 df = pd.DataFrame()
 if raw_df is not None and not raw_df.empty:
     df = prepare_data(raw_df, col_map)
 
-df_issues = df[df["severity"].notna()] if not df.empty else df  # subset all-time yang sudah diberi Resiko Isu
+# =========================================================================
+# TARIK DATA CLICKUP (Highlight Issue) — sekali saat load, bisa di-refresh
+# =========================================================================
+clickup_ready = has_clickup()
+clickup_error = None
+LIST_ID = clickup_list_id()
+
+if "highlight_df" not in st.session_state:
+    st.session_state.highlight_df = pd.DataFrame(columns=HIGHLIGHT_COLUMNS)
+    if clickup_ready:
+        try:
+            st.session_state.highlight_df = fetch_clickup_issues(LIST_ID)
+        except Exception as e:  # noqa: BLE001
+            clickup_error = f"Gagal menarik dari ClickUp: {e}"
+
+highlight_df = st.session_state.highlight_df
 
 # =========================================================================
-# SIDEBAR — FILTER MINGGU
+# SIDEBAR — FILTER MINGGU (hanya memengaruhi tab Rekap Laporan)
 # =========================================================================
 st.sidebar.header("📅 Filter Periode")
-# Filter berdasarkan SEMUA laporan (df), bukan cuma yang sudah diklasifikasi
-# severity-nya — supaya pilihan minggu tetap muncul walau triase belum jalan.
+st.sidebar.caption("Filter minggu ini hanya berlaku untuk tab **Rekap Laporan**.")
 all_pairs = []
 anchor_pair = None
 if not df.empty and df["year"].notna().any() and df["week"].notna().any():
@@ -342,32 +555,28 @@ if not df.empty and df["year"].notna().any() and df["week"].notna().any():
     labels_desc = [f"Week {w} {y}" for (y, w) in pairs_desc]
     chosen_idx = st.sidebar.selectbox("Pilih Minggu", range(len(pairs_desc)), format_func=lambda i: labels_desc[i])
     anchor_pair = pairs_desc[chosen_idx]
-    st.sidebar.caption("Chart Laporan Per Minggu & Tren Harian otomatis merekap hingga 4 minggu ke belakang dari minggu ini.")
+    st.sidebar.caption("Bar & tren harian otomatis merekap hingga 4 minggu ke belakang dari minggu ini.")
 else:
     st.sidebar.caption("Belum ada data untuk difilter.")
 
 if anchor_pair:
     anchor_idx = all_pairs.index(anchor_pair)
-    trend_pairs = all_pairs[max(0, anchor_idx - 3): anchor_idx + 1]  # s.d. 4 minggu terakhir s.d. minggu terpilih
+    trend_pairs = all_pairs[max(0, anchor_idx - 3): anchor_idx + 1]
     anchor_label = f"Week {anchor_pair[1]} {anchor_pair[0]}"
-    df_period = filter_pairs(df, [anchor_pair])  # 1 minggu — dipakai SPI, Highlight Issue, Distribusi
-    df_trend = filter_pairs(df, trend_pairs)     # s.d. 4 minggu — dipakai bar & tren harian
+    df_period = filter_pairs(df, [anchor_pair])
+    df_trend = filter_pairs(df, trend_pairs)
 else:
     trend_pairs = []
     anchor_label = None
     df_period = df.iloc[0:0]
     df_trend = df.iloc[0:0]
 
-df_period_issues = (
-    df_period[df_period["severity"].notna()] if "severity" in df_period.columns else df_period
-)  # subset periode (1 minggu) yang sudah diklasifikasi severity
-
 # =========================================================================
-# SIDEBAR — BOBOT SKOR SPI (dinamis, bisa diubah user)
+# SIDEBAR — BOBOT SKOR SPI (status diambil dari Highlight Issue / ClickUp)
 # =========================================================================
 st.sidebar.header("⚖️ Bobot Skor SPI")
 with st.sidebar.expander("Atur bobot", expanded=False):
-    st.caption("Total Skor = Σ (bobot Severity + bobot Status). Sesuaikan dengan aturan skoring internal Anda.")
+    st.caption("Total Skor = Σ (bobot Severity + bobot Status) dari Highlight Issue.")
     sev_w = {}
     for lvl in ("Low", "Medium", "High"):
         sev_w[lvl] = st.number_input(
@@ -375,11 +584,16 @@ with st.sidebar.expander("Atur bobot", expanded=False):
             value=DEFAULT_SEVERITY_WEIGHT[lvl], step=1, key=f"sevw_{lvl}",
         )
 
-    status_values = sorted(df_issues["status"].dropna().unique().tolist()) if not df_issues.empty else list(DEFAULT_STATUS_WEIGHT)
+    _statuses = sorted(
+        s for s in highlight_df.get("Status", pd.Series(dtype=object)).dropna().unique() if str(s).strip()
+    )
+    status_values = _statuses or list(DEFAULT_STATUS_WEIGHT)
     status_w = {}
     for s in status_values:
         default_val = DEFAULT_STATUS_WEIGHT.get(s, 1)
-        status_w[s] = st.number_input(f"Bobot Status: {s}", min_value=0, max_value=20, value=default_val, step=1, key=f"statw_{s}")
+        status_w[s] = st.number_input(
+            f"Bobot Status: {s}", min_value=0, max_value=20, value=default_val, step=1, key=f"statw_{s}"
+        )
     status_default = st.number_input("Bobot Status lainnya (default)", min_value=0, max_value=20, value=1, step=1)
 
 if not status_w:
@@ -395,41 +609,41 @@ st.markdown(
     f"""
     <div class="becare-hero">
         <h1>🟢 BeCare — System Performance Index &amp; Highlight Issue</h1>
-        <p>Monitoring sistem untuk operasional yang lebih andal · <b>{periode_txt}</b></p>
+        <p>Rekap laporan (Google Sheet) &amp; Highlight Issue + SPI (ClickUp) · <b>Rekap: {periode_txt}</b></p>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
 # =========================================================================
-# RINGKASAN CEPAT — selalu tampil di atas tab untuk sekilas pandang
+# RINGKASAN CEPAT
 # =========================================================================
-total_laporan_minggu = len(df_period)
-issue_aktif = (
-    int((df_period["status"].fillna("Open") != "Closed Permanent").sum())
-    if not df_period.empty else 0
-)
-if not df_period_issues.empty:
-    _kpi_counts, _, _, _kpi_spi = compute_spi(df_period_issues, sev_w, status_w, status_default)
-    kpi_spi_display = f"{_kpi_spi:.2f}"
-    kpi_high = _kpi_counts["High"]
+spi_src_all = highlight_to_spi_source(highlight_df)
+spi_src_valid = spi_src_all[spi_src_all["severity"].notna()]
+if not spi_src_valid.empty:
+    _kc, _kti, _kts, _kspi = compute_spi(spi_src_valid, sev_w, status_w, status_default)
+    kpi_spi_display, kpi_high = f"{_kspi:.2f}", _kc["High"]
 else:
-    kpi_spi_display = "—"
-    kpi_high = 0
+    kpi_spi_display, kpi_high = "—", 0
 
 k1, k2, k3, k4 = st.columns(4)
-k1.metric("📄 Total Laporan", total_laporan_minggu, help="Jumlah laporan pada minggu yang dipilih")
-k2.metric("🎯 Skor SPI", kpi_spi_display, help="Skor SPI minggu terpilih (butuh Resiko Isu terklasifikasi)")
-k3.metric("🔄 Issue Aktif", issue_aktif, help="Laporan minggu ini yang statusnya belum Closed Permanent")
-k4.metric("🔴 Issue High", kpi_high, help="Jumlah issue level High minggu ini")
+k1.metric("📄 Laporan Minggu Ini", len(df_period), help="Jumlah laporan Google Sheet pada minggu terpilih")
+k2.metric("📝 Highlight Issue", len(highlight_df), help="Jumlah issue ditarik dari ClickUp")
+k3.metric("🎯 Skor SPI", kpi_spi_display, help="Dihitung dari Highlight Issue (ClickUp)")
+k4.metric("🔴 Issue High", kpi_high, help="Jumlah issue level High di Highlight Issue")
 
-tab1, tab2, tab3 = st.tabs(["📈 Rekap Laporan", "📊 System Performance Index", "📝 Highlight Issue"])
+tab_rekap, tab_highlight, tab_spi = st.tabs(
+    ["📈 Rekap Laporan", "📝 Highlight Issue", "📊 System Performance Index"]
+)
 
-with tab1:
-    st.caption("Volume laporan mentah — tidak tergantung status klasifikasi Resiko Isu.")
+# =========================================================================
+# TAB 1 — REKAP LAPORAN (Google Sheet)
+# =========================================================================
+with tab_rekap:
+    st.caption("Volume laporan mentah dari Google Sheet — tidak tergantung klasifikasi Risiko Isu.")
 
     if df_trend.empty:
-        st.info("Belum ada data pada periode yang dipilih. Hubungkan/upload data dan pilih minggu di sidebar.")
+        st.info("Belum ada data pada periode yang dipilih. Cek koneksi Google Sheet & pilih minggu di sidebar.")
     else:
         wk_counts = (
             df_trend.dropna(subset=["year", "week"])
@@ -528,32 +742,92 @@ with tab1:
         st.caption(f"Pelaporan {anchor_label} didominasi oleh **{dominant}** ({dominant_pct:.1f}%).")
 
 
-with tab2:
+# =========================================================================
+# TAB 2 — HIGHLIGHT ISSUE (ditarik dari ClickUp)
+# =========================================================================
+with tab_highlight:
+    hc1, hc2 = st.columns([3, 1])
+    hc1.caption(
+        f"Ditarik otomatis dari ClickUp — list **Monitoring Issue Operational** (`{LIST_ID}`). "
+        "Boleh diedit manual sebelum diunduh; SPI dihitung dari tabel ini."
+    )
+    if hc2.button("🔄 Tarik ulang dari ClickUp", use_container_width=True, disabled=not clickup_ready):
+        fetch_clickup_issues.clear()
+        try:
+            st.session_state.highlight_df = fetch_clickup_issues(LIST_ID)
+            st.rerun()
+        except Exception as e:  # noqa: BLE001
+            st.error(f"Gagal menarik dari ClickUp: {e}")
+
+    if not clickup_ready:
+        st.warning(
+            "🔌 ClickUp belum terhubung. Tambahkan di **Secrets**:\n\n"
+            "```toml\n[clickup]\napi_token = \"pk_xxxxx\"\nlist_id = \"901820651612\"\n```\n\n"
+            "Personal token dibuat di ClickUp → Settings → Apps → *Generate*."
+        )
+    elif clickup_error:
+        st.error(clickup_error)
+
+    if highlight_df.empty:
+        st.info("Belum ada Highlight Issue. Klik **Tarik ulang dari ClickUp** setelah token dipasang.")
+    else:
+        st.caption(f"{len(highlight_df)} issue termuat.")
+
+    edited = st.data_editor(
+        st.session_state.highlight_df,
+        num_rows="dynamic",
+        use_container_width=True,
+        key="highlight_editor",
+        column_config={
+            "No": st.column_config.NumberColumn("No", width="small"),
+            "Modul": st.column_config.TextColumn("Modul"),
+            "Tanggal Pelaporan": st.column_config.TextColumn("Tanggal Pelaporan"),
+            "Deskripsi": st.column_config.TextColumn("Deskripsi", width="large"),
+            "Solusi / Update": st.column_config.TextColumn("Solusi / Update", width="large"),
+            "Risiko Isu": st.column_config.SelectboxColumn(
+                "Risiko Isu", options=["Belum Dinilai", "Low", "Medium", "High"]
+            ),
+            "Due Date": st.column_config.TextColumn("Due Date"),
+            "Status": st.column_config.SelectboxColumn(
+                "Status", options=["Open", "On Progress", "Workaround", "Close", "Closed Permanent"]
+            ),
+            "Link": st.column_config.LinkColumn("Link", display_text="buka di ClickUp"),
+        },
+    )
+    if not edited.empty:
+        edited["No"] = range(1, len(edited) + 1)
+    st.session_state.highlight_df = edited
+    highlight_df = edited
+
+    csv_bytes = highlight_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "⬇️ Download Highlight Issue (CSV)", data=csv_bytes,
+        file_name="highlight_issue.csv", mime="text/csv",
+    )
+
+
+# =========================================================================
+# TAB 3 — SYSTEM PERFORMANCE INDEX (dihitung dari Highlight Issue / ClickUp)
+# =========================================================================
+with tab_spi:
     st.latex(
         r"SPI_{Severity+Status}=\dfrac{\text{Total Skor}}{\text{Total Issue}}"
         r"\qquad \text{Total Skor}=\sum_{i=1}^{n}\big(\text{Bobot Severity}_i+\text{Bobot Status}_i\big)"
     )
+    st.caption("Sumber: tabel **Highlight Issue** (ClickUp). Ubah bobot di sidebar untuk menyesuaikan aturan skoring.")
 
-    if df_period.empty:
-        st.info("Belum ada data pada periode yang dipilih. Hubungkan/upload data dan pilih minggu di sidebar.")
-    elif df_period_issues.empty:
+    spi_src = highlight_to_spi_source(highlight_df)
+    spi_src_valid = spi_src[spi_src["severity"].notna()]
+
+    if highlight_df.empty:
+        st.info("Belum ada Highlight Issue untuk dihitung. Tarik data di tab **Highlight Issue** dulu.")
+    elif spi_src_valid.empty:
         st.warning(
-            f"Ada **{len(df_period)} laporan** pada periode ini, tapi belum satupun yang diberi klasifikasi "
-            "**Resiko Isu** (severity) di sheet — Skor SPI baru bisa dihitung setelah kolom itu diisi "
-            "(biasanya diisi saat proses triase/review issue, bukan otomatis dari form). "
-            "Sambil menunggu, Anda tetap bisa mulai menyusun **Highlight Issue** manual di bagian bawah."
+            f"Ada **{len(highlight_df)} issue** di Highlight Issue, tapi belum ada yang diberi **Risiko Isu** "
+            "(Low/Medium/High). Isi kolom Risiko Isu di ClickUp atau langsung di tabel Highlight Issue."
         )
     else:
-        counts, total_isu, total_skor, spi = compute_spi(df_period_issues, sev_w, status_w, status_default)
-
-        # --- perbandingan dengan minggu sebelumnya (persis 1 minggu sebelum minggu terpilih) ---
-        spi_prev = None
-        if anchor_pair in all_pairs:
-            anchor_idx_all = all_pairs.index(anchor_pair)
-            if anchor_idx_all > 0:
-                prev_issues = filter_pairs(df_issues, [all_pairs[anchor_idx_all - 1]])
-                if not prev_issues.empty:
-                    _, _, _, spi_prev = compute_spi(prev_issues, sev_w, status_w, status_default)
+        counts, total_isu, total_skor, spi = compute_spi(spi_src_valid, sev_w, status_w, status_default)
 
         m1, m2, m3, m4, m5, m6 = st.columns(6)
         m1.metric(f"{STATUS_ICON['Low']} Low", counts["Low"])
@@ -561,8 +835,7 @@ with tab2:
         m3.metric(f"{STATUS_ICON['High']} High", counts["High"])
         m4.metric("Total Isu", total_isu)
         m5.metric("Total Skor", f"{total_skor:.0f}")
-        delta = None if spi_prev is None else round(spi - spi_prev, 2)
-        m6.metric("Skor SPI", f"{spi:.2f}", delta=delta, delta_color="inverse")
+        m6.metric("Skor SPI", f"{spi:.2f}")
 
         if counts["High"] > 0:
             st.warning(f"⚠️ Ada **{counts['High']} issue level HIGH** yang perlu perhatian segera.")
@@ -601,124 +874,23 @@ with tab2:
             st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
         with c2:
-            st.markdown("**Tren Skor SPI per Minggu (4 minggu terakhir)**")
-            trend_rows = []
-            for (y, w) in trend_pairs:
-                sub = filter_pairs(df_issues, [(y, w)])
-                _, _, _, spi_w = compute_spi(sub, sev_w, status_w, status_default)
-                trend_rows.append({"label": f"W{w} '{str(y)[-2:]}", "spi": spi_w})
-            if len(trend_rows) >= 2:
-                trend_df = pd.DataFrame(trend_rows)
-                fig2 = go.Figure(
-                    go.Scatter(
-                        x=trend_df["label"], y=trend_df["spi"],
-                        mode="lines+markers+text",
-                        line=dict(color="#0ca30c", width=2),
-                        marker=dict(size=9, color="#0ca30c"),
-                        text=[f"{v:.2f}" for v in trend_df["spi"]],
-                        textposition="top center",
-                        hovertemplate="<b>%{x}</b><br>Skor SPI: %{y:.2f}<extra></extra>",
-                    )
-                )
-                fig2.update_layout(
-                    height=230,
-                    margin=dict(l=10, r=10, t=20, b=10),
-                    hovermode="x unified",
-                    yaxis=dict(showgrid=True, gridcolor="#e1e0d9", title="Skor SPI"),
-                    xaxis=dict(showgrid=False, title=None),
-                    plot_bgcolor="#fcfcfb",
-                    paper_bgcolor="rgba(0,0,0,0)",
-                    showlegend=False,
-                )
-                st.plotly_chart(fig2, use_container_width=True, config={"displayModeBar": False})
+            st.markdown("**Rincian SPI per Modul**")
+            per_mod = []
+            for mod, grp in spi_src.groupby("modul"):
+                grp_valid = grp[grp["severity"].notna()]
+                if grp_valid.empty:
+                    continue
+                _, n_isu, skor, spi_m = compute_spi(grp_valid, sev_w, status_w, status_default)
+                per_mod.append({"Modul": mod, "Isu": n_isu, "Total Skor": round(skor), "Skor SPI": round(spi_m, 2)})
+            if per_mod:
+                per_mod_df = pd.DataFrame(per_mod).sort_values("Skor SPI", ascending=False)
+                st.dataframe(per_mod_df, use_container_width=True, hide_index=True, height=230)
             else:
-                st.info("Riwayat minggu di data ini belum cukup (< 2 minggu) untuk menampilkan tren Skor SPI.")
+                st.caption("Belum ada modul dengan Risiko Isu terisi.")
 
-
-with tab3:
-    st.caption("Tabel ini dinamis — tambah, edit, atau hapus baris langsung. Bisa juga diisi otomatis dari data terfilter.")
-
-    if "highlight_df" not in st.session_state:
-        st.session_state.highlight_df = pd.DataFrame(columns=HIGHLIGHT_COLUMNS)
-
-    ac1, ac2, ac3 = st.columns([1.4, 1, 1])
-    n_auto = ac1.number_input("Jumlah issue prioritas diambil", min_value=1, max_value=20, value=5, step=1)
-    auto_fill = ac2.button("➕ Isi otomatis dari data terfilter", use_container_width=True)
-    clear_table = ac3.button("🗑️ Kosongkan tabel", use_container_width=True)
-
-    if clear_table:
-        st.session_state.highlight_df = pd.DataFrame(columns=HIGHLIGHT_COLUMNS)
-
-    if auto_fill:
-        if df_period.empty:
-            st.warning("Tidak ada data pada periode terpilih untuk diambil otomatis.")
-        else:
-            sev_rank = {"High": 3, "Medium": 2, "Low": 1}
-            cand = df_period.copy()
-            cand["_rank"] = cand["severity"].map(sev_rank).fillna(0)
-            # Status kosong (belum ditriase) dianggap masih "Open" — tetap layak jadi kandidat highlight.
-            is_open = cand["status"].fillna("Open") != "Closed Permanent"
-            cand = cand[(cand["_rank"] >= 2) | is_open]
-            cand = cand.sort_values(["_rank", "timestamp"], ascending=[False, False]).head(n_auto)
-
-            new_rows = pd.DataFrame({
-                "No": range(1, len(cand) + 1),
-                "Modul": cand["modul"].values,
-                "Tanggal Pelaporan": cand["timestamp"].dt.date.astype(str).values,
-                "Deskripsi": cand["deskripsi"].fillna("-").values,
-                "Solusi / Update": cand["solusi"].fillna("-").values,
-                "Risiko Isu": cand["severity"].fillna("Belum Dinilai").values,
-                "Due Date": cand["due_date"].dt.date.astype(str).where(cand["due_date"].notna(), "TBD").values,
-                "Status": cand["status"].fillna("Open").values,
-            })
-            combined = pd.concat([st.session_state.highlight_df, new_rows], ignore_index=True)
-            combined = combined.drop_duplicates(subset=["Modul", "Deskripsi"], keep="first")
-            combined["No"] = range(1, len(combined) + 1)
-            st.session_state.highlight_df = combined
-
-    edited = st.data_editor(
-        st.session_state.highlight_df,
-        num_rows="dynamic",
-        use_container_width=True,
-        key="highlight_editor",
-        column_config={
-            "No": st.column_config.NumberColumn("No", width="small"),
-            "Modul": st.column_config.TextColumn("Modul"),
-            "Tanggal Pelaporan": st.column_config.TextColumn("Tanggal Pelaporan"),
-            "Deskripsi": st.column_config.TextColumn("Deskripsi", width="large"),
-            "Solusi / Update": st.column_config.TextColumn("Solusi / Update", width="large"),
-            "Risiko Isu": st.column_config.SelectboxColumn("Risiko Isu", options=["Belum Dinilai", "Low", "Medium", "High"]),
-            "Due Date": st.column_config.TextColumn("Due Date"),
-            "Status": st.column_config.SelectboxColumn(
-                "Status", options=["Open", "On Progress", "Workaround", "Closed Permanent", "Closed Temporary (workaround)"]
-            ),
-        },
-    )
-    edited["No"] = range(1, len(edited) + 1)
-    st.session_state.highlight_df = edited
-
-    dc1, dc2 = st.columns([1, 3])
-    csv_bytes = st.session_state.highlight_df.to_csv(index=False).encode("utf-8")
-    dc1.download_button("⬇️ Download Highlight Issue (CSV)", data=csv_bytes, file_name="highlight_issue.csv", mime="text/csv")
-
-    # --- opsional: simpan balik ke Google Sheet, hanya aktif jika service account tersedia ---
-    if source_mode == "Google Sheet (Live)" and sheet_url.strip():
-        if has_service_account():
-            if dc2.button("💾 Simpan Highlight Issue ke tab 'Highlight Issue' di Google Sheet"):
-                try:
-                    gc = get_gspread_client()
-                    sh = gc.open_by_key(extract_sheet_id(sheet_url))
-                    try:
-                        ws = sh.worksheet("Highlight Issue")
-                        ws.clear()
-                    except Exception:  # noqa: BLE001
-                        ws = sh.add_worksheet("Highlight Issue", rows=100, cols=len(HIGHLIGHT_COLUMNS))
-                    ws.update([HIGHLIGHT_COLUMNS] + st.session_state.highlight_df.astype(str).values.tolist())
-                    st.success("Tersimpan ke Google Sheet, tab 'Highlight Issue'.")
-                except Exception as e:  # noqa: BLE001
-                    st.error(f"Gagal menyimpan ke Google Sheet: {e}")
-        else:
-            dc2.caption(
-                "💡 Tambahkan kredensial `gcp_service_account` di *Secrets* untuk mengaktifkan simpan-otomatis "
-                "Highlight Issue ke tab Google Sheet Anda (opsional)."
+        with st.expander("Lihat daftar issue yang dihitung"):
+            show = highlight_df[highlight_df["Risiko Isu"].isin(["Low", "Medium", "High"])]
+            st.dataframe(
+                show[["No", "Modul", "Deskripsi", "Risiko Isu", "Status"]],
+                use_container_width=True, hide_index=True,
             )
